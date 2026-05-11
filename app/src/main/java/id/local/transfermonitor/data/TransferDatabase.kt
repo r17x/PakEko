@@ -5,7 +5,9 @@ import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
-import id.local.transfermonitor.util.PaymentNotificationParser
+import id.local.transfermonitor.parser.PaymentNotificationParser
+import id.local.transfermonitor.parser.PaymentParseDecision
+import id.local.transfermonitor.parser.SegmentSerializer
 import id.local.transfermonitor.util.WebhookSendResult
 
 class TransferDatabase(context: Context) :
@@ -15,13 +17,16 @@ class TransferDatabase(context: Context) :
         createNotificationEventsTable(db)
         createPaymentDetectionsTable(db)
         createWebhookDeliveriesTable(db)
+        createMonitoredAppsTable(db)
+        createUserPatternsTable(db)
         createIndexes(db)
+        seedBcaPatterns(db, System.currentTimeMillis())
+        db.execSQL(
+            "INSERT OR IGNORE INTO monitored_apps (package_name, app_label, added_at) VALUES ('$BCA_PACKAGE', 'myBCA', ${System.currentTimeMillis()})"
+        )
     }
 
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
-        if (oldVersion < 2) {
-            migrateToVersion2(db)
-        }
     }
 
     private fun createNotificationEventsTable(db: SQLiteDatabase) {
@@ -85,6 +90,39 @@ class TransferDatabase(context: Context) :
         )
     }
 
+    private fun createMonitoredAppsTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE monitored_apps (
+                package_name TEXT PRIMARY KEY NOT NULL,
+                app_label TEXT NOT NULL,
+                added_at INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
+    }
+
+    private fun createUserPatternsTable(db: SQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE user_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                package_name TEXT NOT NULL,
+                label TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                match_field TEXT NOT NULL,
+                title_text TEXT,
+                segments_json TEXT NOT NULL,
+                confidence REAL NOT NULL DEFAULT 0.95,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """.trimIndent()
+        )
+        db.execSQL("CREATE INDEX idx_user_patterns_package ON user_patterns(package_name)")
+    }
+
     private fun createIndexes(db: SQLiteDatabase) {
         db.execSQL(
             "CREATE INDEX idx_notification_events_captured_at ON notification_events(captured_at DESC)"
@@ -103,46 +141,50 @@ class TransferDatabase(context: Context) :
         )
     }
 
-    private fun migrateToVersion2(db: SQLiteDatabase) {
-        db.execSQL("ALTER TABLE notification_events ADD COLUMN idempotency_key TEXT")
-        db.execSQL(
-            """
-            UPDATE notification_events
-            SET idempotency_key = raw_hash
-            WHERE idempotency_key IS NULL OR idempotency_key = ''
-            """.trimIndent()
+    private fun seedBcaPatterns(db: SQLiteDatabase, now: Long) {
+        data class SeedPattern(val label: String, val direction: PatternDirection, val titleText: String, val segmentsJson: String)
+        val patterns = listOf(
+            SeedPattern("BCA incoming (EN)", PatternDirection.INCOMING,
+                "Financial Diary",
+                SegmentSerializer.toJson(listOf(
+                    PatternSegment("You received", SegmentRole.LITERAL),
+                    PatternSegment("", SegmentRole.AMOUNT),
+                    PatternSegment("from", SegmentRole.LITERAL),
+                    PatternSegment("", SegmentRole.SENDER),
+                    PatternSegment("at Account Transfer category.", SegmentRole.LITERAL),
+                ))),
+            SeedPattern("BCA incoming (ID)", PatternDirection.INCOMING,
+                "Catatan Finansial",
+                SegmentSerializer.toJson(listOf(
+                    PatternSegment("Pemasukan sebesar", SegmentRole.LITERAL),
+                    PatternSegment("", SegmentRole.AMOUNT),
+                    PatternSegment("dari", SegmentRole.LITERAL),
+                    PatternSegment("", SegmentRole.SENDER),
+                    PatternSegment("di kategori Transfer Rekening.", SegmentRole.LITERAL),
+                ))),
+            SeedPattern("BCA outgoing (EN)", PatternDirection.OUTGOING,
+                "Financial Diary",
+                SegmentSerializer.toJson(listOf(
+                    PatternSegment("You sent", SegmentRole.LITERAL),
+                    PatternSegment("", SegmentRole.AMOUNT),
+                    PatternSegment("", SegmentRole.WILDCARD),
+                ))),
+            SeedPattern("BCA outgoing (ID)", PatternDirection.OUTGOING,
+                "Catatan Finansial",
+                SegmentSerializer.toJson(listOf(
+                    PatternSegment("Pengeluaran sebesar", SegmentRole.LITERAL),
+                    PatternSegment("", SegmentRole.AMOUNT),
+                    PatternSegment("di kategori", SegmentRole.LITERAL),
+                    PatternSegment("", SegmentRole.WILDCARD),
+                ))),
         )
-
-        db.execSQL("ALTER TABLE payment_detections ADD COLUMN idempotency_key TEXT")
-        db.execSQL(
-            """
-            UPDATE payment_detections
-            SET idempotency_key = (
-                SELECT notification_events.idempotency_key
-                FROM notification_events
-                WHERE notification_events.id = payment_detections.notification_event_id
+        patterns.forEach { p ->
+            db.execSQL(
+                """INSERT INTO user_patterns (package_name, label, direction, match_field, title_text, segments_json, confidence, enabled, created_at, updated_at)
+                   VALUES (?, ?, ?, 'body', ?, ?, 0.99, 1, ?, ?)""",
+                arrayOf<Any>(BCA_PACKAGE, p.label, p.direction.name.lowercase(), p.titleText, p.segmentsJson, now, now),
             )
-            WHERE idempotency_key IS NULL OR idempotency_key = ''
-            """.trimIndent()
-        )
-        db.execSQL(
-            """
-            UPDATE payment_detections
-            SET idempotency_key = 'legacy-' || id
-            WHERE idempotency_key IS NULL OR idempotency_key = ''
-            """.trimIndent()
-        )
-
-        createWebhookDeliveriesTable(db)
-        db.execSQL(
-            "CREATE INDEX IF NOT EXISTS idx_notification_events_idempotency_key ON notification_events(idempotency_key)"
-        )
-        db.execSQL(
-            "CREATE INDEX IF NOT EXISTS idx_payment_detections_idempotency_key ON payment_detections(idempotency_key)"
-        )
-        db.execSQL(
-            "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_updated_at ON webhook_deliveries(updated_at DESC)"
-        )
+        }
     }
 
     fun insertCapturedNotification(captured: CapturedNotification): CaptureInsertResult {
@@ -231,6 +273,48 @@ class TransferDatabase(context: Context) :
             }
         }
 
+    fun filteredEvents(
+        packageName: String? = null,
+        onlyParsed: Boolean? = null,
+        sinceMs: Long? = null,
+        limit: Int = 200,
+    ): List<NotificationEvent> {
+        val conditions = mutableListOf<String>()
+        val args = mutableListOf<String>()
+
+        packageName?.let {
+            conditions.add("package_name = ?")
+            args.add(it)
+        }
+        onlyParsed?.let { parsed ->
+            if (parsed) conditions.add("ignored_reason IS NULL")
+            else conditions.add("ignored_reason IS NOT NULL")
+        }
+        sinceMs?.let {
+            conditions.add("captured_at >= ?")
+            args.add(it.toString())
+        }
+
+        val where = if (conditions.isEmpty()) "" else "WHERE ${conditions.joinToString(" AND ")}"
+        return readableDatabase.rawQuery(
+            """
+            SELECT id, package_name, app_label, title, text, big_text, sub_text,
+                   posted_at, captured_at, raw_hash, idempotency_key, ignored_reason
+            FROM notification_events
+            $where
+            ORDER BY captured_at DESC
+            LIMIT ?
+            """.trimIndent(),
+            (args + limit.toString()).toTypedArray()
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) {
+                    add(cursor.toNotificationEvent())
+                }
+            }
+        }
+    }
+
     fun recentDetections(limit: Int = 100): List<PaymentDetection> =
         readableDatabase.rawQuery(
             """
@@ -293,7 +377,7 @@ class TransferDatabase(context: Context) :
             }
         }
 
-    fun parseStoredEvent(eventId: Long): SingleParseResult? {
+    fun parseStoredEvent(eventId: Long, userPatterns: List<UserPattern> = emptyList()): SingleParseResult? {
         val now = System.currentTimeMillis()
         return writableDatabase.transaction {
             val event = eventById(eventId) ?: return@transaction null
@@ -303,6 +387,7 @@ class TransferDatabase(context: Context) :
                 text = event.text,
                 bigText = event.bigText,
                 subText = event.subText,
+                userPatterns = userPatterns,
             )
             val duplicate = hasEarlierEventWithIdempotencyKey(event)
             val ignoredReason = if (duplicate) {
@@ -338,7 +423,7 @@ class TransferDatabase(context: Context) :
         }
     }
 
-    fun reparseStoredEvents(): ReparseResult {
+    fun reparseStoredEvents(monitoredPackages: Set<String> = emptySet(), userPatterns: List<UserPattern> = emptyList()): ReparseResult {
         val events = allEvents()
         val now = System.currentTimeMillis()
 
@@ -350,13 +435,19 @@ class TransferDatabase(context: Context) :
             val seenIdempotencyKeys = mutableSetOf<String>()
 
             events.forEach { event ->
-                val decision = PaymentNotificationParser.parse(
-                    packageName = event.packageName,
-                    title = event.title,
-                    text = event.text,
-                    bigText = event.bigText,
-                    subText = event.subText,
-                )
+                val isMonitored = event.packageName in monitoredPackages
+                val decision = if (isMonitored) {
+                    PaymentNotificationParser.parse(
+                        packageName = event.packageName,
+                        title = event.title,
+                        text = event.text,
+                        bigText = event.bigText,
+                        subText = event.subText,
+                        userPatterns = userPatterns,
+                    )
+                } else {
+                    PaymentParseDecision.notMonitored(event.packageName)
+                }
                 val duplicate = !seenIdempotencyKeys.add(event.idempotencyKey)
                 val ignoredReason = if (duplicate) {
                     "duplicate_notification"
@@ -523,6 +614,7 @@ class TransferDatabase(context: Context) :
 
     fun deleteAll() {
         writableDatabase.transaction {
+            delete("user_patterns", null, null)
             delete("webhook_deliveries", null, null)
             delete("payment_detections", null, null)
             delete("notification_events", null, null)
@@ -751,12 +843,140 @@ class TransferDatabase(context: Context) :
         }
     }
 
+    // --- MonitoredAppRepository methods ---
+
+    fun monitoredPackages(): Set<String> =
+        readableDatabase.rawQuery("SELECT package_name FROM monitored_apps", emptyArray()).use { cursor ->
+            buildSet { while (cursor.moveToNext()) add(cursor.getString(0)) }
+        }
+
+    fun allMonitoredApps(): List<MonitoredApp> =
+        readableDatabase.rawQuery(
+            "SELECT package_name, app_label, added_at FROM monitored_apps ORDER BY app_label ASC",
+            emptyArray()
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) {
+                    add(MonitoredApp(
+                        packageName = cursor.getString(0),
+                        appLabel = cursor.getString(1),
+                        addedAt = cursor.getLong(2),
+                    ))
+                }
+            }
+        }
+
+    fun addApp(packageName: String, appLabel: String) {
+        writableDatabase.insertWithOnConflict(
+            "monitored_apps", null,
+            ContentValues().apply {
+                put("package_name", packageName)
+                put("app_label", appLabel)
+                put("added_at", System.currentTimeMillis())
+            },
+            SQLiteDatabase.CONFLICT_IGNORE,
+        )
+    }
+
+    fun removeApp(packageName: String) {
+        writableDatabase.delete("monitored_apps", "package_name = ?", arrayOf(packageName))
+    }
+
+    fun isMonitored(packageName: String): Boolean =
+        readableDatabase.rawQuery(
+            "SELECT 1 FROM monitored_apps WHERE package_name = ? LIMIT 1",
+            arrayOf(packageName)
+        ).use { cursor -> cursor.moveToFirst() }
+
+    // --- UserPatternRepository methods ---
+
+    fun patternsForPackage(packageName: String): List<UserPattern> =
+        queryPatterns("WHERE package_name = ?", arrayOf(packageName))
+
+    fun allPatterns(): List<UserPattern> =
+        queryPatterns(null, emptyArray())
+
+    fun allEnabledPatterns(): List<UserPattern> =
+        queryPatterns("WHERE enabled = 1", emptyArray())
+
+    private fun queryPatterns(where: String?, args: Array<String>): List<UserPattern> =
+        readableDatabase.rawQuery(
+            "$PATTERN_SELECT_COLUMNS ${where ?: ""} ORDER BY id ASC",
+            args,
+        ).use { cursor ->
+            buildList { while (cursor.moveToNext()) add(cursor.toUserPattern()) }
+        }
+
+    fun insertPattern(
+        packageName: String, label: String, direction: PatternDirection,
+        matchField: MatchField, titleText: String?, segmentsJson: String, confidence: Double,
+    ): Long {
+        val now = System.currentTimeMillis()
+        return writableDatabase.insert("user_patterns", null,
+            ContentValues().apply {
+                put("package_name", packageName)
+                put("label", label)
+                put("direction", direction.name.lowercase())
+                put("match_field", matchField.name.lowercase())
+                if (titleText != null) put("title_text", titleText) else putNull("title_text")
+                put("segments_json", segmentsJson)
+                put("confidence", confidence)
+                put("enabled", 1)
+                put("created_at", now)
+                put("updated_at", now)
+            }
+        )
+    }
+
+    fun updatePattern(pattern: UserPattern) {
+        val now = System.currentTimeMillis()
+        writableDatabase.update("user_patterns",
+            ContentValues().apply {
+                put("label", pattern.label)
+                put("direction", pattern.direction.name.lowercase())
+                put("match_field", pattern.matchField.name.lowercase())
+                if (pattern.titleText != null) put("title_text", pattern.titleText) else putNull("title_text")
+                put("segments_json", pattern.segmentsJson)
+                put("confidence", pattern.confidence)
+                put("enabled", if (pattern.enabled) 1 else 0)
+                put("updated_at", now)
+            },
+            "id = ?", arrayOf(pattern.id.toString()),
+        )
+    }
+
+    fun deletePattern(id: Long) {
+        writableDatabase.delete("user_patterns", "id = ?", arrayOf(id.toString()))
+    }
+
+    fun toggleEnabled(id: Long, enabled: Boolean) {
+        writableDatabase.update("user_patterns",
+            ContentValues().apply {
+                put("enabled", if (enabled) 1 else 0)
+                put("updated_at", System.currentTimeMillis())
+            },
+            "id = ?", arrayOf(id.toString()),
+        )
+    }
+
+    private fun Cursor.toUserPattern(): UserPattern =
+        UserPattern(
+            id = getLong(0), packageName = getString(1), label = getString(2),
+            direction = PatternDirection.valueOf(getString(3).uppercase()),
+            matchField = MatchField.valueOf(getString(4).uppercase()),
+            titleText = if (isNull(5)) null else getString(5),
+            segmentsJson = getString(6), confidence = getDouble(7),
+            enabled = getInt(8) == 1, createdAt = getLong(9), updatedAt = getLong(10),
+        )
+
     companion object {
         private const val DATABASE_NAME = "transfer_monitor.db"
-        private const val DATABASE_VERSION = 2
+        private const val DATABASE_VERSION = 1
+        private const val BCA_PACKAGE = "com.bca.mybca.omni.android"
         private const val WEBHOOK_STATUS_PENDING = "pending"
         private const val WEBHOOK_STATUS_SENT = "sent"
         private const val WEBHOOK_STATUS_FAILED = "failed"
         private const val WEBHOOK_STATUS_SKIPPED = "skipped"
+        private const val PATTERN_SELECT_COLUMNS = "SELECT id, package_name, label, direction, match_field, title_text, segments_json, confidence, enabled, created_at, updated_at FROM user_patterns"
     }
 }

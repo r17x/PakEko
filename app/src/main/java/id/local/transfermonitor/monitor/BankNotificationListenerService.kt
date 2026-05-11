@@ -7,21 +7,20 @@ import android.os.Build
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import id.local.transfermonitor.TransferMonitorApp
-import id.local.transfermonitor.data.CapturedNotification
-import id.local.transfermonitor.data.MonitorSettings
-import id.local.transfermonitor.util.PaymentNotificationParser
-import id.local.transfermonitor.util.WebhookDispatcher
+import id.local.transfermonitor.protocol.AppIntent
 import id.local.transfermonitor.util.notificationIdempotencyKey
 import id.local.transfermonitor.util.sha256Hex
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 
 class BankNotificationListenerService : NotificationListenerService() {
     private val executor = Executors.newSingleThreadExecutor()
+    private val appLabelCache = ConcurrentHashMap<String, String>()
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         val packageName = sbn.packageName ?: return
-
-        if (packageName !in MonitorSettings.SUPPORTED_BANK_PACKAGES) return
+        val app = (application as? TransferMonitorApp) ?: return
+        if (packageName !in app.runtime.monitoredApps.value) return
 
         val notification = sbn.notification ?: return
         val title = notification.readString(Notification.EXTRA_TITLE)
@@ -30,42 +29,27 @@ class BankNotificationListenerService : NotificationListenerService() {
         val subText = notification.readString(Notification.EXTRA_SUB_TEXT)
         val lines = notification.readLines()
         val storedText = if (text.isBlank()) lines else text
-        val parseDecision = PaymentNotificationParser.parse(
-            packageName = packageName,
-            title = title,
-            text = storedText,
-            bigText = bigText,
-            subText = subText,
-        )
-
         val rawHash = sha256Hex(
             listOf(packageName, title, text, bigText, subText, lines, sbn.postTime.toString())
                 .joinToString(separator = "|")
         )
         val idempotencyKey = notificationIdempotencyKey(title = title, message = storedText)
-
-        val captured = CapturedNotification(
-            packageName = packageName,
-            appLabel = packageName.appLabel(),
-            title = title,
-            text = storedText,
-            bigText = bigText,
-            subText = subText,
-            postedAt = sbn.postTime,
-            rawHash = rawHash,
-            idempotencyKey = idempotencyKey,
-            ignoredReason = parseDecision.ignoredReason,
-            parsedAmount = parseDecision.parsedAmount,
-            confidence = parseDecision.confidence,
-            bankCode = parseDecision.bankCode,
-        )
+        val postedAt = sbn.postTime
 
         executor.execute {
-            val database = (application as TransferMonitorApp).database
-            val result = database.insertCapturedNotification(captured)
-            result.detection?.let { detection ->
-                WebhookDispatcher.sendConfigured(applicationContext, database, detection)
-            }
+            app.runtime.send(
+                AppIntent.CaptureNotification(
+                    packageName = packageName,
+                    appLabel = packageName.appLabel(),
+                    title = title,
+                    text = storedText,
+                    bigText = bigText,
+                    subText = subText,
+                    postedAt = postedAt,
+                    rawHash = rawHash,
+                    idempotencyKey = idempotencyKey,
+                )
+            )
         }
     }
 
@@ -88,19 +72,21 @@ class BankNotificationListenerService : NotificationListenerService() {
             .orEmpty()
 
     private fun String.appLabel(): String =
-        try {
-            val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                packageManager.getApplicationInfo(
-                    this,
-                    PackageManager.ApplicationInfoFlags.of(0)
-                )
-            } else {
-                @Suppress("DEPRECATION")
-                packageManager.getApplicationInfo(this, 0)
+        appLabelCache.getOrPut(this) {
+            try {
+                val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    packageManager.getApplicationInfo(
+                        this,
+                        PackageManager.ApplicationInfoFlags.of(0)
+                    )
+                } else {
+                    @Suppress("DEPRECATION")
+                    packageManager.getApplicationInfo(this, 0)
+                }
+                packageManager.getApplicationLabel(info).toString()
+            } catch (_: PackageManager.NameNotFoundException) {
+                this
             }
-            packageManager.getApplicationLabel(info).toString()
-        } catch (_: PackageManager.NameNotFoundException) {
-            this
         }
 
 }

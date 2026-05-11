@@ -15,6 +15,11 @@ data class NotificationEvent(
     val ignoredReason: String?,
 )
 
+fun NotificationEvent.bodyPreview(): String =
+    listOf(text, bigText, subText)
+        .filter { it.isNotBlank() }
+        .joinToString("\n")
+
 data class PaymentDetection(
     val id: Long,
     val notificationEventId: Long,
@@ -85,4 +90,34 @@ data class WebhookRetryResult(
     val failedCount: Int,
 )
 
-const val CURRENT_PARSER_VERSION = "idr-v1"
+data class MonitoredApp(
+    val packageName: String,
+    val appLabel: String,
+    val addedAt: Long,
+)
+
+enum class PatternDirection { INCOMING, OUTGOING }
+enum class MatchField { TITLE, BODY, COMBINED }
+
+data class UserPattern(
+    val id: Long,
+    val packageName: String,
+    val label: String,
+    val direction: PatternDirection,
+    val matchField: MatchField,
+    val titleText: String?,
+    val segmentsJson: String,
+    val confidence: Double,
+    val enabled: Boolean,
+    val createdAt: Long,
+    val updatedAt: Long,
+)
+
+enum class SegmentRole { LITERAL, AMOUNT, SENDER, WILDCARD }
+
+data class PatternSegment(
+    val text: String,
+    val role: SegmentRole,
+)
+
+const val CURRENT_PARSER_VERSION = "idr-v2"

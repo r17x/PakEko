@@ -1,21 +1,30 @@
-package id.local.transfermonitor.util
+package id.local.transfermonitor.parser
 
-data class IdrParseResult(
-    val amount: Long,
-    val confidence: Double,
-)
+object AmountParser {
+    fun parse(text: String): AmountParseResult? {
+        var pos = 0
+        while (pos < text.length) {
+            val prefixEnd = matchCurrencyPrefix(text, pos, requireWordBoundary = true)
+            if (prefixEnd != null) {
+                var amountStart = prefixEnd
+                while (amountStart < text.length && text[amountStart].isWhitespace()) amountStart++
 
-object IdrAmountParser {
-    private val currencyPattern =
-        Regex("""(?i)\b(?:rp|idr)\s*([0-9][0-9.,\s]{2,})""")
-
-    fun parse(text: String): IdrParseResult? {
-        val match = currencyPattern.find(text) ?: return null
-        val amount = parseAmount(match.groupValues[1]) ?: return null
-        return IdrParseResult(amount = amount, confidence = 0.95)
+                val amountResult = consumeAmountDigits(text, amountStart)
+                if (amountResult != null) {
+                    val amount = normalizeAmount(amountResult.first)
+                    if (amount != null) {
+                        return AmountParseResult(amount = amount, confidence = 0.95)
+                    }
+                }
+            }
+            pos++
+        }
+        return null
     }
 
-    fun parseAmount(amountText: String): Long? {
+    fun parseAmount(amountText: String): Long? = normalizeAmount(amountText)
+
+    private fun normalizeAmount(amountText: String): Long? {
         val compact = amountText.trim()
             .replace(" ", "")
             .replace("\u00A0", "")
